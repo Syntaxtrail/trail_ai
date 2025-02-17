@@ -1,6 +1,4 @@
-Here's an updated `README.md` for the project named **"Trail AI"**:
 
-```markdown
 # Trail AI 🧭✨
 
 Welcome to **Trail AI**, your beginner's journey into the realm of conversational AI! This project is designed for students eager to explore:
@@ -40,7 +38,7 @@ Here's the tech stack you'll encounter:
 To embark on this coding adventure:
 
 1. **Clone the repository**:  
-   ```
+   ```bash
    git clone [your-repository-url]
    ```
 
@@ -49,7 +47,7 @@ To embark on this coding adventure:
 3. **Training Data**: Prepare or use `train_data.dat` formatted as `question|answer`.
 
 4. **Run the script**: 
-   ```
+   ```bash
    python main.py
    ```
 
@@ -93,5 +91,3 @@ This project is under the [MIT License](LICENSE).
 
 Happy exploring with Trail AI, where every line of code leads to a new learning adventure! 🌍✨
 ```
-
-This README.md for "Trail AI" is designed to engage and educate students, blending technical detail with a touch of fun and encouragement to explore further.
