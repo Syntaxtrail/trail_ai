@@ -27,7 +27,7 @@ def trim_spaces(input_str):
     return input_str.strip()
 
 def extract_keywords(input_str):
-    # Use a basic approach to extract keywords without spaCy
+    
     return [word for word in re.findall(r'\b\w+\b', input_str.lower()) if len(word) > 2]
 
 def find_best_match(input_str, questions):
