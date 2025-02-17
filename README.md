@@ -39,7 +39,7 @@ To embark on this coding adventure:
 
 1. **Clone the repository**:  
    ```bash
-   git clone [your-repository-url]
+   git clone https://github.com/Syntaxtrail/trail_ai
    ```
 
 2. **Python Installation**: Make sure Python is installed on your system.
@@ -48,7 +48,7 @@ To embark on this coding adventure:
 
 4. **Run the script**: 
    ```bash
-   python main.py
+   python ai.py
    ```
 
 ## 📖 How It Works
@@ -90,4 +90,3 @@ This project is under the [MIT License](LICENSE).
 ---
 
 Happy exploring with Trail AI, where every line of code leads to a new learning adventure! 🌍✨
-```
