@@ -85,7 +85,7 @@ The trail doesn't end here! You can:
 
 ## 📜 License
 
-This project is under the [BSD-2-Clause license](LICENCE).
+This project is under the [BSD-2-Clause license](LICENSE).
 
 ---
 
