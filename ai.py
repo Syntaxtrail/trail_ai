@@ -7,12 +7,24 @@ from datetime import datetime
 import os
 import math
 
+
+TRANSFORMER_AVAILABLE = False
+try:
+    import torch
+    from transformers import AutoModel, AutoTokenizer, pipeline
+    TRANSFORMER_AVAILABLE = True
+    print("Transformer library detected! Enhanced capabilities available.")
+except ImportError:
+    print("Transformer library not detected. Using basic similarity methods.")
+    print("For enhanced capabilities, install transformers with: pip install transformers torch")
+
 MAX_LINE_LENGTH = 512
 MAX_QUESTIONS = 1000
 MATCH_THRESHOLD = 0.55
 CONTEXT_HISTORY_SIZE = 8
 LOGS_DIRECTORY = "conversation_logs"
 USER_PROFILE_PATH = "user_profile.json"
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 
 if not os.path.exists(LOGS_DIRECTORY):
     os.makedirs(LOGS_DIRECTORY)
@@ -74,20 +86,81 @@ class SimpleTFIDF:
         return [self._calculate_tfidf(doc) for doc in documents]
 
 
+class TransformerSimilarity:
+    def __init__(self, model_name=MODEL_NAME):
+        if not TRANSFORMER_AVAILABLE:
+            raise ImportError("Transformer libraries not available")
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model.to(self.device)
+        self.embeddings = None
+        self.documents = []
+    
+    def _mean_pooling(self, model_output, attention_mask):
+
+        token_embeddings = model_output[0]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+    
+    def get_embedding(self, text):
+
+        encoded_input = self.tokenizer(text, padding=True, truncation=True, max_length=128, return_tensors='pt')
+        encoded_input = {k: v.to(self.device) for k, v in encoded_input.items()}
+        
+
+        with torch.no_grad():
+            model_output = self.model(**encoded_input)
+        
+        
+        embedding = self._mean_pooling(model_output, encoded_input['attention_mask'])
+        
+        
+        embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
+        
+        return embedding.cpu()
+    
+    def fit_transform(self, documents):
+        self.documents = documents
+        
+        batch_size = 32
+        all_embeddings = []
+        
+        for i in range(0, len(documents), batch_size):
+            batch_docs = documents[i:i+batch_size]
+            embeddings = self.get_embedding(batch_docs)
+            all_embeddings.append(embeddings)
+        
+        self.embeddings = torch.cat(all_embeddings, dim=0)
+        return self.embeddings
+    
+    def transform(self, documents):
+        if isinstance(documents, str):
+            documents = [documents]
+        
+        return self.get_embedding(documents)
+
+
 def cosine_similarity(vec1, vec2):
-    dot_product = sum(a*b for a, b in zip(vec1, vec2))
-    norm1 = math.sqrt(sum(a*a for a in vec1))
-    norm2 = math.sqrt(sum(b*b for b in vec2))
-    
-    if norm1 == 0 or norm2 == 0:
-        return 0
-    
-    return dot_product / (norm1 * norm2)
+    if TRANSFORMER_AVAILABLE and isinstance(vec1, torch.Tensor) and isinstance(vec2, torch.Tensor):
+        return torch.nn.functional.cosine_similarity(vec1, vec2).item()
+    else:
+     
+        dot_product = sum(a*b for a, b in zip(vec1, vec2))
+        norm1 = math.sqrt(sum(a*a for a in vec1))
+        norm2 = math.sqrt(sum(b*b for b in vec2))
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0
+        
+        return dot_product / (norm1 * norm2)
 
 
 class UserProfile:
     def __init__(self):
         self.data = self._load_profile()
+        self.sentiment_analyzer = None
         
     def _load_profile(self):
         try:
@@ -128,14 +201,29 @@ class UserProfile:
         self.save_profile()
     
     def analyze_sentiment(self, text):
-        positive_words = {'good', 'great', 'excellent', 'awesome', 'happy', 'love', 'like', 'thanks', 'thank'}
-        negative_words = {'bad', 'terrible', 'awful', 'hate', 'dislike', 'poor', 'angry', 'sad', 'frustrated'}
+        try:
         
-        words = set(extract_keywords(text.lower()))
-        pos_count = len(words.intersection(positive_words))
-        neg_count = len(words.intersection(negative_words))
-        
-        sentiment = "positive" if pos_count > neg_count else "negative" if neg_count > pos_count else "neutral"
+            if TRANSFORMER_AVAILABLE and self.sentiment_analyzer is not None:
+                result = self.sentiment_analyzer(text)
+                if result[0]['label'] == 'POSITIVE':
+                    sentiment = "positive"
+                elif result[0]['label'] == 'NEGATIVE':
+                    sentiment = "negative"
+                else:
+                    sentiment = "neutral"
+            else:
+                
+                positive_words = {'good', 'great', 'excellent', 'awesome', 'happy', 'love', 'like', 'thanks', 'thank'}
+                negative_words = {'bad', 'terrible', 'awful', 'hate', 'dislike', 'poor', 'angry', 'sad', 'frustrated'}
+                
+                words = set(extract_keywords(text.lower()))
+                pos_count = len(words.intersection(positive_words))
+                neg_count = len(words.intersection(negative_words))
+                
+                sentiment = "positive" if pos_count > neg_count else "negative" if neg_count > pos_count else "neutral"
+        except Exception as e:
+            print(f"Error in sentiment analysis: {e}")
+            sentiment = "neutral"
         
         self.data["sentiment_history"].append(sentiment)
         if len(self.data["sentiment_history"]) > 20:
@@ -143,6 +231,16 @@ class UserProfile:
         
         self.save_profile()
         return sentiment
+    
+    def load_sentiment_analyzer(self):
+        if TRANSFORMER_AVAILABLE:
+            try:
+                self.sentiment_analyzer = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english", 
+                                                 device=0 if torch.cuda.is_available() else -1)
+                return True
+            except Exception as e:
+                print(f"Could not load sentiment analyzer: {e}")
+        return False
 
 
 def load_training_data(filename):
@@ -196,13 +294,23 @@ def extract_keywords(input_str):
     return [word for word in words if word not in stop_words and len(word) > 2]
 
 
-def find_best_match_tfidf(input_str, tfidf_obj, tfidf_matrix, questions, conversation_context):
-    input_vector = tfidf_obj.transform(input_str.lower())[0]
+def find_best_match(input_str, similarity_obj, questions, conversation_context):
+    if TRANSFORMER_AVAILABLE and isinstance(similarity_obj, TransformerSimilarity):
+        input_embed = similarity_obj.transform(input_str.lower())
+        
+       
+        similarity_scores = []
+        for i in range(len(similarity_obj.embeddings)):
+            question_embed = similarity_obj.embeddings[i:i+1]
+            score = torch.nn.functional.cosine_similarity(input_embed, question_embed).item()
+            similarity_scores.append(score)
+    else:
+
+        input_vector = similarity_obj.transform(input_str.lower())[0]
+        similarity_scores = [cosine_similarity(input_vector, similarity_obj.tfidf_matrix[i]) 
+                             for i in range(len(similarity_obj.tfidf_matrix))]
     
-    cosine_sims = [cosine_similarity(input_vector, tfidf_matrix[i]) for i in range(len(tfidf_matrix))]
-    
-    candidates = [(score, idx) for idx, score in enumerate(cosine_sims) if score >= MATCH_THRESHOLD]
-    
+    candidates = [(score, idx) for idx, score in enumerate(similarity_scores) if score >= MATCH_THRESHOLD]
     candidates.sort(reverse=True)
     
     if candidates and candidates[0][0] >= MATCH_THRESHOLD:
@@ -214,9 +322,16 @@ def find_best_match_tfidf(input_str, tfidf_obj, tfidf_matrix, questions, convers
             context_boost = 0
             for i, recent_q in enumerate(conversation_context["recent_questions"]):
                 recency_weight = 1.0 - (i * 0.15)
-                recent_vector = tfidf_obj.transform(recent_q.lower())[0]
-                question_vector = tfidf_obj.transform(questions[idx].lower())[0]
-                context_similarity = cosine_similarity(recent_vector, question_vector)
+                
+                if TRANSFORMER_AVAILABLE and isinstance(similarity_obj, TransformerSimilarity):
+                    recent_embed = similarity_obj.transform(recent_q.lower())
+                    question_embed = similarity_obj.embeddings[idx:idx+1]
+                    context_similarity = torch.nn.functional.cosine_similarity(recent_embed, question_embed).item()
+                else:
+                    recent_vector = similarity_obj.transform(recent_q.lower())[0]
+                    question_vector = similarity_obj.transform(questions[idx].lower())[0]
+                    context_similarity = cosine_similarity(recent_vector, question_vector)
+                
                 context_boost += context_similarity * recency_weight * 0.25
             
             enhanced_score = score + context_boost
@@ -228,6 +343,7 @@ def find_best_match_tfidf(input_str, tfidf_obj, tfidf_matrix, questions, convers
             return context_enhanced_candidates[0][1]
     
     return -1
+
 
 def small_talk(input_str, user_profile):
     small_talk_responses = {
@@ -336,7 +452,7 @@ def generate_fallback_response(context, user_input, user_profile):
     return random.choice(general_fallbacks)
 
 
-def respond(input_str, questions, responses, context, tfidf_obj, tfidf_matrix, user_profile):
+def respond(input_str, questions, responses, context, similarity_obj, user_profile):
     user_profile.update_interaction(input_str)
     user_profile.analyze_sentiment(input_str)
     
@@ -355,7 +471,7 @@ def respond(input_str, questions, responses, context, tfidf_obj, tfidf_matrix, u
     if small_talk_response:
         response = small_talk_response
     else:
-        index = find_best_match_tfidf(input_str, tfidf_obj, tfidf_matrix, questions, context)
+        index = find_best_match(input_str, similarity_obj, questions, context)
         
         if index != -1:
             response = responses[index]
@@ -409,10 +525,23 @@ def show_stats(context, user_profile):
     print("-----------------------------")
 
 
-def train_simple_tfidf(questions):
+def initialize_similarity_model(questions):
+    if TRANSFORMER_AVAILABLE:
+        try:
+            print("Loading transformer model. This may take a moment...")
+            transformer = TransformerSimilarity()
+            transformer.fit_transform(questions)
+            print("Transformer model loaded successfully!")
+            return transformer
+        except Exception as e:
+            print(f"Error loading transformer model: {e}")
+            print("Falling back to TF-IDF similarity...")
+    
+
+    print("Using TF-IDF similarity model")
     tfidf = SimpleTFIDF()
-    tfidf_matrix = tfidf.fit_transform(questions)
-    return tfidf, tfidf_matrix
+    tfidf.fit_transform(questions)
+    return tfidf
 
 
 def main():
@@ -426,17 +555,25 @@ def main():
         print("No training data found. Using only built-in responses.")
     
     print("Loading NLP models...")
-    tfidf_obj, tfidf_matrix = train_simple_tfidf(questions)
+    similarity_obj = initialize_similarity_model(questions)
     
     print("Loading user profile...")
     user_profile = UserProfile()
+    if TRANSFORMER_AVAILABLE:
+        if user_profile.load_sentiment_analyzer():
+            print("Enhanced sentiment analysis loaded.")
+        else:
+            print("Using basic sentiment analysis.")
+    else:
+        print("Using basic sentiment analysis.")
+    
     user_profile.start_conversation()
     
     context = {"session_start": time.time()}
     
     if user_profile.is_returning_user():
         last_seen = user_profile.data["last_seen"]
-        if last_seen:  # Check if last_seen is not None or empty
+        if last_seen:
             last_seen = datetime.fromisoformat(last_seen)
             days_since_last_visit = (datetime.now() - last_seen).days
             
@@ -469,7 +606,7 @@ def main():
         elif user_input.lower() == "stats":
             show_stats(context, user_profile)
         else:
-            respond(user_input, questions, responses, context, tfidf_obj, tfidf_matrix, user_profile)
+            respond(user_input, questions, responses, context, similarity_obj, user_profile)
 
 if __name__ == "__main__":
     try:
