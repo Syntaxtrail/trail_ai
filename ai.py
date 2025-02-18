@@ -3,15 +3,150 @@ import re
 import json
 import time
 from difflib import SequenceMatcher
+from datetime import datetime
+import os
+import math
 
 MAX_LINE_LENGTH = 512
-MAX_QUESTIONS = 200
-MATCH_THRESHOLD = 0.55  
-CONTEXT_HISTORY_SIZE = 5
+MAX_QUESTIONS = 1000
+MATCH_THRESHOLD = 0.55
+CONTEXT_HISTORY_SIZE = 8
+LOGS_DIRECTORY = "conversation_logs"
+USER_PROFILE_PATH = "user_profile.json"
+
+if not os.path.exists(LOGS_DIRECTORY):
+    os.makedirs(LOGS_DIRECTORY)
+
+class SimpleTFIDF:
+    def __init__(self):
+        self.vectorizer = None
+        self.tfidf_matrix = None
+        self.idf = {}
+        self.vocab = {}
+        self.documents = []
+    
+    def _tokenize(self, text):
+        return [w.lower() for w in re.findall(r'\b\w+\b', text) if w.lower() not in self.stop_words and len(w) > 2]
+    
+    def fit_transform(self, documents):
+        self.documents = documents
+        self.stop_words = {'a', 'an', 'the', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 'be', 'been',
+                    'to', 'of', 'in', 'for', 'with', 'by', 'about', 'against', 'between', 'into'}
+        
+        doc_count = {}
+        for i, doc in enumerate(documents):
+            tokens = self._tokenize(doc)
+            for token in set(tokens):
+                doc_count[token] = doc_count.get(token, 0) + 1
+        
+        N = len(documents)
+        self.vocab = {token: idx for idx, token in enumerate(doc_count.keys())}
+        self.idf = {token: math.log((N + 1) / (count + 1)) + 1 for token, count in doc_count.items()}
+        
+        self.tfidf_matrix = [self._calculate_tfidf(doc) for doc in documents]
+        
+        return self.tfidf_matrix
+    
+    def _calculate_tfidf(self, document):
+        tokens = self._tokenize(document)
+        if not tokens:
+            return [0] * len(self.vocab)
+        
+        tf = {}
+        for token in tokens:
+            tf[token] = tf.get(token, 0) + 1
+        
+        for token in tf:
+            tf[token] /= len(tokens)
+        
+        tfidf_vector = [0] * len(self.vocab)
+        for token, freq in tf.items():
+            if token in self.vocab:
+                idx = self.vocab[token]
+                tfidf_vector[idx] = freq * self.idf.get(token, 0)
+        
+        return tfidf_vector
+    
+    def transform(self, documents):
+        if isinstance(documents, str):
+            documents = [documents]
+        
+        return [self._calculate_tfidf(doc) for doc in documents]
+
+
+def cosine_similarity(vec1, vec2):
+    dot_product = sum(a*b for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(a*a for a in vec1))
+    norm2 = math.sqrt(sum(b*b for b in vec2))
+    
+    if norm1 == 0 or norm2 == 0:
+        return 0
+    
+    return dot_product / (norm1 * norm2)
+
+
+class UserProfile:
+    def __init__(self):
+        self.data = self._load_profile()
+        
+    def _load_profile(self):
+        try:
+            with open(USER_PROFILE_PATH, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {
+                "favorite_topics": {},
+                "conversation_count": 0,
+                "total_interactions": 0,
+                "last_seen": None,
+                "sentiment_history": []
+            }
+    
+    def save_profile(self):
+        with open(USER_PROFILE_PATH, 'w') as f:
+            json.dump(self.data, f, indent=2)
+    
+    def update_interaction(self, user_input):
+        self.data["total_interactions"] += 1
+        self.data["last_seen"] = datetime.now().isoformat()
+        
+        keywords = extract_keywords(user_input)
+        for keyword in keywords:
+            self.data["favorite_topics"][keyword] = self.data["favorite_topics"].get(keyword, 0) + 1
+        
+        self.save_profile()
+    
+    def get_favorite_topics(self, limit=3):
+        topics = sorted(self.data["favorite_topics"].items(), key=lambda x: x[1], reverse=True)
+        return [topic for topic, count in topics[:limit]]
+    
+    def is_returning_user(self):
+        return self.data["conversation_count"] > 0
+    
+    def start_conversation(self):
+        self.data["conversation_count"] += 1
+        self.save_profile()
+    
+    def analyze_sentiment(self, text):
+        positive_words = {'good', 'great', 'excellent', 'awesome', 'happy', 'love', 'like', 'thanks', 'thank'}
+        negative_words = {'bad', 'terrible', 'awful', 'hate', 'dislike', 'poor', 'angry', 'sad', 'frustrated'}
+        
+        words = set(extract_keywords(text.lower()))
+        pos_count = len(words.intersection(positive_words))
+        neg_count = len(words.intersection(negative_words))
+        
+        sentiment = "positive" if pos_count > neg_count else "negative" if neg_count > pos_count else "neutral"
+        
+        self.data["sentiment_history"].append(sentiment)
+        if len(self.data["sentiment_history"]) > 20:
+            self.data["sentiment_history"] = self.data["sentiment_history"][-20:]
+        
+        self.save_profile()
+        return sentiment
+
 
 def load_training_data(filename):
-    questions = []
-    responses = []
+    questions, responses = [], []
     try:
         with open(filename, 'r', encoding='utf-8') as file:
             for line in file:
@@ -21,58 +156,33 @@ def load_training_data(filename):
                 if len(parts) == 2:
                     questions.append(parts[0].strip().lower())
                     responses.append(parts[1].strip())
-        print(f"Loaded {len(questions)} question-response pairs")
     except FileNotFoundError:
         print("Error: Training data file not found.")
     except IOError:
         print("Error: Could not read the training data file.")
     return questions, responses
 
-def save_user_interaction(user_input, ai_response):
+
+def save_user_interaction(user_input, ai_response, context):
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_file = os.path.join(LOGS_DIRECTORY, f"{today}.jsonl")
+    
     try:
-        with open("interaction_history.jsonl", "a", encoding='utf-8') as file:
+        with open(log_file, "a", encoding='utf-8') as file:
             record = {
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamp": datetime.now().isoformat(),
                 "user_input": user_input,
-                "ai_response": ai_response
+                "ai_response": ai_response,
+                "context_used": bool(context.get("recent_questions"))
             }
             file.write(json.dumps(record) + "\n")
     except IOError:
         print("Warning: Could not save interaction to history file")
 
-def similarity_score(str1, str2):
 
+def similarity_score(str1, str2):
     return SequenceMatcher(None, str1, str2).ratio()
 
-def semantic_similarity(words1, words2):
-    
-    if not words1 or not words2:
-        return 0
-    
-
-    weighted_words1 = {w: 0.5 + min(len(w) / 10, 0.5) for w in words1}
-    weighted_words2 = {w: 0.5 + min(len(w) / 10, 0.5) for w in words2}
-    
-
-    intersection_score = 0
-    for w1 in words1:
-        if w1 in words2:
-            intersection_score += weighted_words1[w1]
-        else:
-
-            for w2 in words2:
-                if (w1.startswith(w2) or w2.startswith(w1)) and min(len(w1), len(w2)) > 3:
-                    intersection_score += weighted_words1[w1] * 0.7  
-                    break
-    
-    total_weight1 = sum(weighted_words1.values())
-    total_weight2 = sum(weighted_words2.values())
-    
-    if total_weight1 == 0 or total_weight2 == 0:
-        return 0
-    
-    
-    return intersection_score / ((total_weight1 + total_weight2) / 2)
 
 def extract_keywords(input_str):
     stop_words = {'a', 'an', 'the', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 'be', 'been',
@@ -85,115 +195,113 @@ def extract_keywords(input_str):
     words = re.findall(r'\b\w+\b', input_str.lower())
     return [word for word in words if word not in stop_words and len(word) > 2]
 
-def find_best_match(input_str, questions, conversation_context):
-    best_score = 0
-    best_idx = -1
-    candidates = []
+
+def find_best_match_tfidf(input_str, tfidf_obj, tfidf_matrix, questions, conversation_context):
+    input_vector = tfidf_obj.transform(input_str.lower())[0]
     
-
-    normalized_input = input_str.lower().strip()
-    for idx, question in enumerate(questions):
-        normalized_question = question.lower().strip()
-        
-
-        if normalized_input == normalized_question:
-            return idx
-        
-
-        direct_score = similarity_score(normalized_input, normalized_question)
-        
-
-        input_keywords = extract_keywords(normalized_input)
-        question_keywords = extract_keywords(normalized_question)
-        semantic_score = semantic_similarity(input_keywords, question_keywords)
-        
-        
-        combined_score = (direct_score * 0.4) + (semantic_score * 0.6)
-        
-        if combined_score >= MATCH_THRESHOLD:
-            candidates.append((combined_score, semantic_score, idx))
+    cosine_sims = [cosine_similarity(input_vector, tfidf_matrix[i]) for i in range(len(tfidf_matrix))]
     
-
+    candidates = [(score, idx) for idx, score in enumerate(cosine_sims) if score >= MATCH_THRESHOLD]
+    
     candidates.sort(reverse=True)
     
-
     if candidates and candidates[0][0] >= MATCH_THRESHOLD:
-        return candidates[0][2]
+        return candidates[0][1]
     
-
     if candidates and "recent_questions" in conversation_context:
         context_enhanced_candidates = []
-        for score, sem_score, idx in candidates:
+        for score, idx in candidates:
             context_boost = 0
-            
-            
             for i, recent_q in enumerate(conversation_context["recent_questions"]):
-                recency_weight = 1.0 - (i * 0.2)
-                recent_keywords = extract_keywords(recent_q)
-                question_keywords = extract_keywords(questions[idx])
-                context_similarity = semantic_similarity(recent_keywords, question_keywords)
-                context_boost += context_similarity * recency_weight * 0.3
+                recency_weight = 1.0 - (i * 0.15)
+                recent_vector = tfidf_obj.transform(recent_q.lower())[0]
+                question_vector = tfidf_obj.transform(questions[idx].lower())[0]
+                context_similarity = cosine_similarity(recent_vector, question_vector)
+                context_boost += context_similarity * recency_weight * 0.25
             
-
             enhanced_score = score + context_boost
             if enhanced_score >= MATCH_THRESHOLD:
-                context_enhanced_candidates.append((enhanced_score, sem_score, idx))
+                context_enhanced_candidates.append((enhanced_score, idx))
         
-
         if context_enhanced_candidates:
             context_enhanced_candidates.sort(reverse=True)
-            return context_enhanced_candidates[0][2]
+            return context_enhanced_candidates[0][1]
     
-
     return -1
 
-def small_talk(input_str):
+def small_talk(input_str, user_profile):
     small_talk_responses = {
-        "hello": ["Hey there! How can I assist you today?", 
-                 "Hello! What can I help you with?", 
-                 "Hi! How can I make your day better?"],
-        "hi": ["Hello! How's your day going?",
-              "Hi there! What can I do for you?",
-              "Hey! Nice to chat with you!"],
-        "hey": ["Hello! What's on your mind?",
-               "Hey there! How can I help?",
-               "Hi! I'm here to assist you!"],
-        "how are you": ["I'm doing well, thanks for asking! How about you?", 
-                       "I'm functioning perfectly! How are you feeling today?", 
-                       "All systems are go! How's your day been?"],
-        "what's your name": ["I'm SyntaxTrail AI. Nice to meet you!", 
-                           "You can call me SyntaxTrail AI. What should I call you?", 
-                           "I'm SyntaxTrail AI, your virtual assistant."],
-        "what can you do": ["I can answer questions, provide information, and chat with you!", 
-                          "I'm here to assist with information, have conversations, and help with various queries.", 
-                          "I can help answer your questions, engage in conversation, and provide assistance when needed."],
-        "who created you": ["I was created by SafwanGanz from the SyntaxTrail team.", 
-                          "My creator is SafwanGanz from SyntaxTrail.", 
-                          "I'm a product of SafwanGanz at SyntaxTrail."],
-        "thank you": ["You're welcome! Is there anything else I can help with?",
-                    "Happy to help! Let me know if you need anything else.",
-                    "My pleasure! Any other questions?"],
-        "thanks": ["You're welcome! Anything else on your mind?",
-                  "No problem at all! What else can I do for you?",
-                  "Glad I could help! Feel free to ask more questions."],
+        "hello": [
+            "Hey there! How can I assist you today?", 
+            "Hello! What can I help you with?", 
+            "Hi! How can I make your day better?"
+        ],
+        "hi": [
+            "Hello! How's your day going?",
+            "Hi there! What can I do for you?",
+            "Hey! Nice to chat with you!"
+        ],
+        "hey": [
+            "Hello! What's on your mind?",
+            "Hey there! How can I help?",
+            "Hi! I'm here to assist you!"
+        ],
+        "how are you": [
+            "I'm doing well, thanks for asking! How about you?", 
+            "I'm functioning perfectly! How are you feeling today?", 
+            "All systems are go! How's your day been?"
+        ],
+        "what's your name": [
+            "I'm SyntaxTrail AI. Nice to meet you!", 
+            "You can call me SyntaxTrail AI. What should I call you?", 
+            "I'm SyntaxTrail AI, your virtual assistant."
+        ],
+        "what can you do": [
+            "I can answer questions, provide information, and chat with you!", 
+            "I'm here to assist with information, have conversations, and help with various queries.", 
+            "I can help answer your questions, engage in conversation, and provide assistance when needed."
+        ],
+        "who created you": [
+            "I was created by SafwanGanz from the SyntaxTrail team.", 
+            "My creator is SafwanGanz from SyntaxTrail.", 
+            "I'm a product of SafwanGanz at SyntaxTrail."
+        ],
+        "thank you": [
+            "You're welcome! Is there anything else I can help with?",
+            "Happy to help! Let me know if you need anything else.",
+            "My pleasure! Any other questions?"
+        ],
+        "thanks": [
+            "You're welcome! Anything else on your mind?",
+            "No problem at all! What else can I do for you?",
+            "Glad I could help! Feel free to ask more questions."
+        ],
     }
     
     input_str = input_str.lower().strip()
     
-
+    if input_str in ["hello", "hi", "hey"] and user_profile.is_returning_user():
+        favorite_topics = user_profile.get_favorite_topics()
+        if favorite_topics:
+            personalized_responses = [
+                f"Welcome back! I remember you were interested in {', '.join(favorite_topics)}. How can I help today?",
+                f"Great to see you again! Last time we talked about {favorite_topics[0]}. What's on your mind now?",
+                f"Hello! Based on our previous chats, would you like to talk more about {favorite_topics[0]}?"
+            ]
+            return random.choice(personalized_responses)
+    
     for key in small_talk_responses:
         if input_str == key:
             return random.choice(small_talk_responses[key])
     
-
     for key in small_talk_responses:
         if key in input_str:
             return random.choice(small_talk_responses[key])
     
-
     return None
 
-def generate_fallback_response(context, user_input):
+
+def generate_fallback_response(context, user_input, user_profile):
     general_fallbacks = [
         "I'm not quite sure about that. Could you provide more details?",
         "I don't have enough information to answer that properly. Can you rephrase or clarify?",
@@ -202,7 +310,10 @@ def generate_fallback_response(context, user_input):
         "I'm not certain I understood correctly. Could you try asking in a different way?"
     ]
     
-    # Check if we can suggest a related topic from conversation history
+    recent_sentiments = user_profile.data["sentiment_history"][-3:] if user_profile.data["sentiment_history"] else []
+    if recent_sentiments and all(s == "negative" for s in recent_sentiments):
+        return "I notice you might be frustrated. I'm sorry I'm not able to help as well as you'd like. Perhaps we can try a different approach or topic?"
+    
     if context.get("recent_questions"):
         input_keywords = extract_keywords(user_input)
         most_related_question = None
@@ -210,62 +321,63 @@ def generate_fallback_response(context, user_input):
         
         for recent_q in context["recent_questions"]:
             recent_keywords = extract_keywords(recent_q)
-            similarity = semantic_similarity(input_keywords, recent_keywords)
+            similarity = similarity_score(user_input, recent_q)
             if similarity > highest_similarity and similarity > 0.3:
                 highest_similarity = similarity
                 most_related_question = recent_q
         
         if most_related_question:
             return f"I'm not sure about that specific question. But we were talking about '{most_related_question}' - would you like to continue discussing that?"
-
+    
+    favorite_topics = user_profile.get_favorite_topics()
+    if favorite_topics and random.random() < 0.3:
+        return f"I'm not sure how to answer that. Based on our previous conversations, would you like to talk more about {favorite_topics[0]}?"
+    
     return random.choice(general_fallbacks)
 
-def respond(input_str, questions, responses, context):
 
+def respond(input_str, questions, responses, context, tfidf_obj, tfidf_matrix, user_profile):
+    user_profile.update_interaction(input_str)
+    user_profile.analyze_sentiment(input_str)
+    
     if "recent_questions" not in context:
         context["recent_questions"] = []
     if "recent_responses" not in context:
         context["recent_responses"] = []
     
-
     if "input_history" not in context:
         context["input_history"] = []
     context["input_history"].insert(0, input_str)
     if len(context["input_history"]) > CONTEXT_HISTORY_SIZE:
         context["input_history"].pop()
     
-    
-    small_talk_response = small_talk(input_str)
+    small_talk_response = small_talk(input_str, user_profile)
     if small_talk_response:
         response = small_talk_response
     else:
-
-        index = find_best_match(input_str, questions, context)
+        index = find_best_match_tfidf(input_str, tfidf_obj, tfidf_matrix, questions, context)
         
         if index != -1:
             response = responses[index]
-
             context["recent_questions"].insert(0, questions[index])
             if len(context["recent_questions"]) > CONTEXT_HISTORY_SIZE:
                 context["recent_questions"].pop()
         else:
-            response = generate_fallback_response(context, input_str)
+            response = generate_fallback_response(context, input_str, user_profile)
     
-
     context["recent_responses"].insert(0, response)
     if len(context["recent_responses"]) > CONTEXT_HISTORY_SIZE:
         context["recent_responses"].pop()
-    
     
     typing_delay = min(0.1 * len(response) / 40, 2.0)
     time.sleep(typing_delay)
     
     print(f"SyntaxTrail AI: {response}")
     
-
-    save_user_interaction(input_str, response)
+    save_user_interaction(input_str, response, context)
     
     return response
+
 
 def show_help():
     print("\n--- SyntaxTrail AI Help ---")
@@ -275,7 +387,33 @@ def show_help():
     print("4. Type 'help' to see this menu again.")
     print("5. You can ask about my capabilities by typing 'what can you do'")
     print("6. Feel free to share feedback on my responses!")
+    print("7. Type 'stats' to see conversation statistics.")
     print("-------------------------")
+
+
+def show_stats(context, user_profile):
+    print("\n--- Conversation Statistics ---")
+    session_duration = round((time.time() - context["session_start"]) / 60, 1)
+    print(f"Current session duration: {session_duration} minutes")
+    print(f"Total conversations: {user_profile.data['conversation_count']}")
+    print(f"Total interactions: {user_profile.data['total_interactions']}")
+    
+    favorite_topics = user_profile.get_favorite_topics(5)
+    if favorite_topics:
+        print(f"Your favorite topics: {', '.join(favorite_topics)}")
+    
+    sentiment_count = {"positive": 0, "negative": 0, "neutral": 0}
+    for sentiment in user_profile.data["sentiment_history"]:
+        sentiment_count[sentiment] += 1
+    print(f"Your recent mood: {max(sentiment_count, key=sentiment_count.get)}")
+    print("-----------------------------")
+
+
+def train_simple_tfidf(questions):
+    tfidf = SimpleTFIDF()
+    tfidf_matrix = tfidf.fit_transform(questions)
+    return tfidf, tfidf_matrix
+
 
 def main():
     print("\n" + "="*50)
@@ -287,19 +425,36 @@ def main():
     if not questions:
         print("No training data found. Using only built-in responses.")
     
-    print("Warming up neural networks...")
-    time.sleep(1)
-    print("Loading conversational models...")
-    time.sleep(0.5)
-    print("Ready!")
+    print("Loading NLP models...")
+    tfidf_obj, tfidf_matrix = train_simple_tfidf(questions)
+    
+    print("Loading user profile...")
+    user_profile = UserProfile()
+    user_profile.start_conversation()
     
     context = {"session_start": time.time()}
-    print("\nWelcome to SyntaxTrail AI! I'm here to chat and answer your questions.")
+    
+    if user_profile.is_returning_user():
+        last_seen = user_profile.data["last_seen"]
+        if last_seen:  # Check if last_seen is not None or empty
+            last_seen = datetime.fromisoformat(last_seen)
+            days_since_last_visit = (datetime.now() - last_seen).days
+            
+            if days_since_last_visit < 1:
+                print("\nWelcome back! It's great to see you again today.")
+            elif days_since_last_visit == 1:
+                print("\nWelcome back after a day! How have you been?")
+            else:
+                print(f"\nWelcome back! It's been {days_since_last_visit} days since we last chatted.")
+        else:
+            print("\nWelcome back! It seems like this is your first visit.")
+    else:
+        print("\nWelcome to SyntaxTrail AI! I'm here to chat and answer your questions.")
+    
     print("Type 'help' for assistance or just say hello to begin.")
     
     while True:
-        user_input = input("\nYou: ")
-        user_input = user_input.strip()
+        user_input = input("\nYou: ").strip()
         
         if not user_input:
             print("SyntaxTrail AI: I didn't catch that. Could you please try again?")
@@ -311,8 +466,10 @@ def main():
             break
         elif user_input.lower() == "help":
             show_help()
+        elif user_input.lower() == "stats":
+            show_stats(context, user_profile)
         else:
-            respond(user_input, questions, responses, context)
+            respond(user_input, questions, responses, context, tfidf_obj, tfidf_matrix, user_profile)
 
 if __name__ == "__main__":
     try:
@@ -322,3 +479,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n\nAn unexpected error occurred: {e}")
         print("SyntaxTrail AI has encountered a problem and needs to restart.")
+        with open(os.path.join(LOGS_DIRECTORY, "error_log.txt"), "a") as f:
+            f.write(f"{datetime.now().isoformat()}: {str(e)}\n")
